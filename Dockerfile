@@ -23,4 +23,3 @@ ENV PORT=8080
 
 # functions-frameworkを使い、main.py内の「article_ingest_service」関数を起動します。
 CMD ["functions-framework", "--target=article_ingest_service", "--port=8080"]
-```python
