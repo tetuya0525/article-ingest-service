@@ -1,20 +1,26 @@
-# Python 3.12の公式イメージをベースとして使用
+# Dockerfile
+# ==============================================================================
+# 建築手順書 (最終確定版)
+# 起動方法を、最もシンプルで確実なfunctions-frameworkに戻します。
+# ==============================================================================
+
+# ベースイメージとして、公式のPython 3.12安定版を使用します。
 FROM python:3.12-slim
 
-# コンテナ内の作業ディレクトリを設定
+# コンテナ内の作業ディレクトリを設定します。
 WORKDIR /app
 
-# 依存関係ファイルをコピー
+# まず、依存関係ファイル(部品リスト)をコピーします。
 COPY requirements.txt .
 
-# 依存関係をインストール
+# 部品リストに基づいて、必要なライブラリをインストールします。
 RUN pip install --no-cache-dir -r requirements.txt
 
-# アプリケーションのソースコードをコピー
+# アプリケーションの本体であるソースコードをコピーします。
 COPY main.py .
 
-# コンテナがリッスンするポートを8080に設定
+# このサービスがリクエストを待ち受けるポートを8080に設定します。
 ENV PORT=8080
 
-# gunicornを使って、main.py内のFlaskアプリ「app」を起動
-CMD exec gunicorn --bind :$PORT --workers 1 --threads 8 --timeout 0 main:app
+# functions-frameworkを使って、main.py内の「article_ingest_service」関数を起動します。
+CMD ["functions-framework", "--target=article_ingest_service", "--port=8080"]
