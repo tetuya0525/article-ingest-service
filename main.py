@@ -1,3 +1,7 @@
+# main.py
+# ==============================================================================
+# 受付係の魂 (ハローワールド・テスト版)
+# ==============================================================================
 import functions_framework
 from flask import jsonify
 
@@ -11,4 +15,3 @@ def article_ingest_service(request):
         "status": "ok",
         "message": "Hello from the Article Ingest Service!"
     }), 200
-```text
