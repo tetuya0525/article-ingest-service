@@ -1,3 +1,7 @@
+# main.py
+# ==============================================================================
+# 受付係の魂 (ハローワールド・テスト版)
+# ==============================================================================
 import functions_framework
 from flask import jsonify
 
@@ -9,5 +13,6 @@ def article_ingest_service(request):
     print("Hello World service was called successfully!")
     return jsonify({
         "status": "ok",
-        "message": "Hello from the simplest service!"
+        "message": "Hello from the Article Ingest Service!"
     }), 200
+```text
