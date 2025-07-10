@@ -21,5 +21,5 @@ COPY main.py .
 # このサービスがリクエストを待ち受けるポートを8080に設定します。
 ENV PORT=8080
 
-# functions-frameworkを使い、main.py内の「article_ingest_service」関数を起動します。
-CMD ["functions-framework", "--target=article_ingest_service", "--port=8080"]
+# gunicornという標準的なWebサーバーを使って、main.py内の「app」を起動します。
+CMD exec gunicorn --bind :$PORT --workers 1 --threads 8 --timeout 0 main:app
