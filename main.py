@@ -4,7 +4,7 @@
 # Role:         Receives a validated JSON object from the API Gateway,
 #               separates it into article and dictionary data, and saves
 #               them to their respective staging collections.
-# Version:      1.1 (Python 3.12 Stable)
+# Version:      1.2 (Final, Cleaned)
 # Author:       心理 (Thinking Partner)
 # Last Updated: 2025-07-10
 # ==============================================================================
@@ -118,4 +118,3 @@ def article_ingest_service(request):
         error_msg = str(e)
         report_error(error_msg, {"request_data": request.get_data(as_text=True)}, tb_str)
         return jsonify({"status": "error", "message": "情報の受付中にサーバー内部でエラーが発生しました。"}), 500
-```text
