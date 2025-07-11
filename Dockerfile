@@ -1,26 +1,26 @@
-# Dockerfile
-# ==============================================================================
-# 建築手順書 (最終確定版)
-# 起動方法を、最もシンプルで確実なfunctions-frameworkに戻します。
-# ==============================================================================
-
-# ベースイメージとして、公式のPython 3.12安定版を使用します。
+# ベースイメージとして公式のPython 3.12スリム版を使用
+# Use the official Python 3.12 slim image as a base
 FROM python:3.12-slim
 
-# コンテナ内の作業ディレクトリを設定します。
+# 作業ディレクトリを設定
+# Set the working directory
 WORKDIR /app
 
-# まず、依存関係ファイル(部品リスト)をコピーします。
+# アプリケーションのソースコードと要件ファイルをコピー
+# Copy the application source code and requirements file
+COPY main.py .
 COPY requirements.txt .
 
-# 部品リストに基づいて、必要なライブラリをインストールします。
-RUN pip install --no-cache-dir -r requirements.txt
+# 環境変数 PORT を設定 (Cloud Runの要件)
+# Set the PORT environment variable (required by Cloud Run)
+ENV PORT 8080
 
-# アプリケーションの本体であるソースコードをコピーします。
-COPY main.py .
+# Pythonのパッケージインストーラーpipをアップグレードし、要件ファイルをインストール
+# Upgrade pip and install the requirements
+RUN pip install --no-cache-dir --upgrade pip -r requirements.txt
 
-# このサービスがリクエストを待ち受けるポートを8080に設定します。
-ENV PORT=8080
-
-# functions-frameworkを使って、main.py内の「article_ingest_service」関数を起動します。
-CMD ["functions-framework", "--target=article_ingest_service", "--port=8080"]
+# コンテナ起動時に実行するコマンドを設定
+# Set the command to run when the container starts
+# functions-frameworkがHTTPリクエストを待ち受け、main.pyのhttp_entryポイントを呼び出す
+# functions-framework will listen for HTTP requests and call the http_entry point in main.py
+CMD ["functions-framework", "--target=http_entry", "--source=main.py"]
