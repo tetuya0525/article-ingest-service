@@ -1,111 +1,151 @@
+# ==============================================================================
+# Memory Library - Article Ingest Service
+# main.py (v1.0 Initial Build)
+#
+# Role:         Gatewayからのリクエストを受け、記事データを検証・初期化し、
+#               ステージング用のDBコレクションに保存する。
+# Version:      1.0
+# Last Updated: 2025-08-24
+# ==============================================================================
 import os
-import secrets
-import hashlib
+import json
+import logging
+from functools import wraps
 from flask import Flask, request, jsonify
+
 import firebase_admin
 from firebase_admin import firestore
-import logging
+import google.auth.transport.requests
+from google.oauth2 import id_token
 
 # --- 初期化 (Initialization) ---
 app = Flask(__name__)
-logging.basicConfig(level=logging.INFO)
 
-# Firestoreクライアントをグローバル変数として保持 (遅延初期化)
+# --- ロギング設定 (構造化) ---
+def setup_logging():
+    logging.basicConfig(level=logging.INFO, format='%(message)s')
+    gunicorn_logger = logging.getLogger('gunicorn.error')
+    app.logger.handlers = gunicorn_logger.handlers
+    app.logger.setLevel(gunicorn_logger.level)
+
+def log_structured(level, message, **kwargs):
+    log_data = {"message": message, "severity": level, **kwargs}
+    app.logger.info(json.dumps(log_data))
+
+# --- Firestore 初期化 (シングルトン) ---
 db = None
-
 def get_firestore_client():
-    """
-    Firestoreクライアントをシングルトンとして取得・初期化する。
-    他の安定したサービスと同じ、堅牢な方式。
-    """
     global db
     if db is None:
         try:
-            firebase_admin.initialize_app()
+            if not firebase_admin._apps:
+                firebase_admin.initialize_app()
             db = firestore.client()
-            app.logger.info("Firebase app initialized successfully.")
+            log_structured('INFO', "Firebase app initialized successfully.")
         except Exception as e:
-            app.logger.error(f"Error initializing Firebase app: {e}")
+            log_structured('CRITICAL', "Firebaseの初期化に失敗しました", error=str(e))
+            raise
     return db
 
+# --- サービス間認証デコレーター ---
+def service_auth_required(f):
+    @wraps(f)
+    def decorated_function(*args, **kwargs):
+        auth_header = request.headers.get('Authorization')
+        if not auth_header or not auth_header.startswith('Bearer '):
+            return jsonify({"status": "error", "message": "認証が必要です"}), 401
+        
+        token = auth_header.split('Bearer ')[1]
+        try:
+            id_token.verify_oauth2_token(token, google.auth.transport.requests.Request())
+        except ValueError as e:
+            log_structured('WARNING', "無効な認証トークンです", error=str(e))
+            return jsonify({"status": "error", "message": "無効な認証トークンです"}), 403
+        
+        return f(*args, **kwargs)
+    return decorated_function
+
+# --- バリデーション関数 ---
+def validate_article_data(data):
+    """投入される記事データの必須項目を検証する"""
+    if not data:
+        return False, "リクエストボディにJSONデータが含まれていません。"
+    
+    required_fields = ['title', 'sourceType', 'content']
+    missing_fields = [field for field in required_fields if field not in data]
+    if missing_fields:
+        return False, f"必須フィールドが不足しています: {', '.join(missing_fields)}"
+    
+    if not isinstance(data.get('content'), dict) or 'rawText' not in data.get('content'):
+        return False, "contentフィールドは'rawText'を含むオブジェクトである必要があります。"
+        
+    if not data.get('title').strip():
+        return False, "titleフィールドは空にできません。"
+
+    return True, None
+
 # --- メインロジック ---
-
-@app.route('/generate', methods=['POST'])
-def generate_api_key():
-    """
-    新しいAPIキーを生成し、ハッシュ化してDBに保存後、
-    平文のキーを一度だけ返す。
-    """
-    db_client = get_firestore_client()
-    if not db_client:
-        return jsonify({"status": "error", "message": "データベース接続エラー"}), 500
-
-    data = request.get_json()
-    user_id = data.get('userId')
-    label = data.get('label')
-
-    if not user_id or not label:
-        return jsonify({"status": "error", "message": "userIdとlabelは必須です。"}), 400
-
+@app.route('/', methods=['POST'])
+@service_auth_required
+def ingest_article():
+    """記事データを受け取り、ステージングDBに保存する"""
     try:
-        plaintext_key = f"sk_{secrets.token_urlsafe(36)}"
-        hashed_key = hashlib.sha256(plaintext_key.encode('utf-8')).hexdigest()
-        key_data = {
-            'userId': user_id,
-            'label': label,
-            'hashedKey': hashed_key,
-            'status': 'active',
+        db_client = get_firestore_client()
+        data = request.get_json()
+
+        # 入力データの検証
+        is_valid, error_message = validate_article_data(data)
+        if not is_valid:
+            log_structured('WARNING', "無効なデータでの投入リクエスト", error=error_message, received_data=data)
+            return jsonify({"status": "error", "message": error_message}), 400
+
+        # Firestoreに保存するドキュメントを作成
+        # 建築憲章スキーマをベースに、ワークフロー用のメタデータを付与 [cite: 382-383]
+        article_doc = {
+            'title': data.get('title'),
+            'sourceType': data.get('sourceType'),
+            'description': data.get('description', ''),
+            'keywords': data.get('keywords', []),
+            'content': {
+                'rawText': data['content'].get('rawText'),
+                'structuredData': data['content'].get('structuredData', {})
+            },
+            'aiGenerated': {}, # この段階では空
+            'status': 'received', # ★ ワークフローの初期ステータス
             'createdAt': firestore.SERVER_TIMESTAMP,
-            'lastUsedAt': None
+            'updatedAt': firestore.SERVER_TIMESTAMP
         }
-        db_client.collection('api_keys').add(key_data)
-        app.logger.info(f"新しいAPIキーを生成しました。 Label: {label}")
+        
+        # staging_articlesコレクションにドキュメントを追加
+        update_time, doc_ref = db_client.collection('staging_articles').add(article_doc)
+        doc_id = doc_ref.id
+        
+        log_structured('INFO', "新しい記事をステージングしました", document_id=doc_id, title=article_doc['title'])
+
         return jsonify({
             "status": "success",
-            "apiKey": plaintext_key,
-            "message": "このキーは一度しか表示されません。安全な場所に保管してください。"
+            "message": "記事データを受け付けました。",
+            "documentId": doc_id
         }), 201
 
     except Exception as e:
-        app.logger.error(f"APIキーの生成中にエラーが発生しました: {e}", exc_info=True)
+        log_structured('ERROR', "記事の投入処理中に予期せぬエラー", error=str(e), exc_info=True)
         return jsonify({"status": "error", "message": "Internal Server Error"}), 500
 
-
-@app.route('/revoke', methods=['POST'])
-def revoke_api_key():
-    """
-    指定されたAPIキー(のドキュメントID)を無効化する。
-    """
-    db_client = get_firestore_client()
-    if not db_client:
-        return jsonify({"status": "error", "message": "データベース接続エラー"}), 500
-        
-    data = request.get_json()
-    key_id = data.get('keyId')
-    user_id = data.get('userId')
-
-    if not key_id or not user_id:
-        return jsonify({"status": "error", "message": "keyIdとuserIdは必須です。"}), 400
-
+# --- ヘルスチェック ---
+@app.route('/health', methods=['GET'])
+def health_check():
+    """ヘルスチェックエンドポイント"""
     try:
-        key_ref = db_client.collection('api_keys').document(key_id)
-        key_doc = key_ref.get()
-
-        if not key_doc.exists:
-            return jsonify({"status": "error", "message": "指定されたキーが見つかりません。"}), 404
-        
-        if key_doc.to_dict().get('userId') != user_id:
-            return jsonify({"status": "error", "message": "このキーを無効化する権限がありません。"}), 403
-
-        key_ref.update({'status': 'revoked'})
-        app.logger.info(f"APIキーを無効化しました。Key ID: {key_id}")
-        return jsonify({"status": "success", "message": "APIキーを無効化しました。"}), 200
-
+        # DB接続のみを確認
+        get_firestore_client()
+        return jsonify({"status": "healthy"}), 200
     except Exception as e:
-        app.logger.error(f"APIキーの無効化中にエラーが発生しました: {e}", exc_info=True)
-        return jsonify({"status": "error", "message": "Internal Server Error"}), 500
+        log_structured('ERROR', "ヘルスチェック失敗", error=str(e))
+        return jsonify({"status": "unhealthy", "error": "Database connection failed"}), 503
 
-
+# --- 起動 ---
 if __name__ == "__main__":
-    # This block is for local development and not used in Cloud Run
-    app.run(host="0.0.0.0", port=int(os.environ.get("PORT", 8080)))
+    setup_logging()
+    port = int(os.environ.get("PORT", 8080))
+    app.run(host="0.0.0.0", port=port, debug=False)
