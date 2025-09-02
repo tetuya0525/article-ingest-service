@@ -1,29 +1,31 @@
 # ==============================================================================
-# Dockerfile for Article Ingest Service (Corrected)
+# Dockerfile for Article Ingest Service (v2 Final Corrected)
 # ==============================================================================
+# Use an official lightweight Python image.
 FROM python:3.12-slim
 
+# Set environment variables to prevent Python from buffering stdout and stderr.
 ENV PYTHONUNBUFFERED True
+# Set the working directory in the container.
 ENV APP_HOME /app
 WORKDIR $APP_HOME
 
-# 1. 先に依存関係をコピー (この時点ではrootユーザー)
+# 1. Copy dependencies file first to leverage Docker cache.
 COPY requirements.txt .
 
-# 2. システムへのインストールはroot権限で実行
+# 2. Install dependencies as root.
 RUN pip install --no-cache-dir -r requirements.txt
 
-# 3. アプリケーション実行用の非rootユーザーを作成
+# 3. Create a non-root user for security.
 RUN adduser --system --group appuser
 
-# 4. アプリケーションコードをコピーし、所有者をappuserに変更
+# 4. Copy the application code and change ownership.
 COPY --chown=appuser:appuser . .
 
-# 5. インストール完了後、非rootユーザーに切り替え
+# 5. Switch to the non-root user.
 USER appuser
 
-# Cloud RunのPORT環境変数を設定
-ENV PORT 8080
-
-# 6. アプリケーションは非rootユーザーで実行される
-CMD ["gunicorn", "--bind", "0.0.0.0:8080", "--workers", "2", "main:app"]
+# --- Corrected Gunicorn command ---
+# Use 'exec' to ensure Gunicorn runs as PID 1 and receives signals correctly.
+# Bind to the port specified by the Cloud Run $PORT environment variable.
+CMD exec gunicorn --bind 0.0.0.0:$PORT --workers 1 "main:app"
