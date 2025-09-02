@@ -1,11 +1,11 @@
 # ==============================================================================
 # Memory Library - Article Ingest Service
-# main.py (v1.2 Production)
+# main.py (v1.3 Production)
 #
 # Role:         Gatewayからのリクエストを受け、記事データを検証・初期化し、
 #               ステージング用のDBコレクションに保存する。
-#               ログは中央ログ集約サービスへ送信する。
-# Version:      1.2
+#               ログは中央ログ集約サービスへ送信し、起動時の堅牢性を確保。
+# Version:      1.3
 # Last Updated: 2025-09-02
 # ==============================================================================
 
@@ -22,7 +22,7 @@ import firebase_admin
 import google.auth.transport.requests
 import requests
 from firebase_admin import firestore
-from flask import Flask, jsonify, request
+from flask import Flask, jsonify, request, current_app
 from google.oauth2 import id_token
 
 
@@ -36,34 +36,6 @@ class Config:
     STAGING_COLLECTION: str = os.environ.get("STAGING_COLLECTION", "staging_articles")
     LOG_AGGREGATOR_URL: str = os.environ.get("LOG_AGGREGATOR_URL")
     SERVICE_NAME: str = os.environ.get("K_SERVICE", "article-ingest-service")
-
-
-# ==============================================================================
-# Centralized Structured Logging
-# ==============================================================================
-# Gunicornからの起動時に備え、基本的なlogging設定を先に行う
-logging.basicConfig(level=logging.INFO, stream=sys.stdout)
-
-def log_structured(level: str, message: str, **kwargs):
-    """構造化ログを指定されたURLに送信する。失敗した場合は標準出力にフォールバックする。"""
-    log_payload = {
-        "timestamp": datetime.utcnow().isoformat() + "Z",
-        "service": Config.SERVICE_NAME,
-        "severity": level.upper(),
-        "message": message,
-        **kwargs,
-    }
-    
-    if Config.LOG_AGGREGATOR_URL:
-        try:
-            requests.post(Config.LOG_AGGREGATOR_URL, json=log_payload, timeout=2.0)
-        except requests.RequestException as e:
-            # フォールバック: 集約サービスに失敗した場合は標準出力にログを書き出す
-            print(f"Failed to send log to aggregator: {e}", file=sys.stderr)
-            print(json.dumps(log_payload), file=sys.stderr)
-    else:
-        # ローカル開発用: URLが設定されていなければ標準出力に書き出す
-        print(json.dumps(log_payload))
 
 
 # ==============================================================================
@@ -87,13 +59,54 @@ def get_firestore_client() -> firestore.Client:
 
 
 # ==============================================================================
+# Centralized Structured Logging
+# ==============================================================================
+def log_structured(level: str, message: str, **kwargs):
+    """構造化ログを生成し、ロギングを行う"""
+    log_payload = {
+        "timestamp": datetime.utcnow().isoformat() + "Z",
+        "service": Config.SERVICE_NAME,
+        "severity": level.upper(),
+        "message": message,
+        **kwargs,
+    }
+    
+    # Gunicorn/FlaskのロガーにJSONとして出力する
+    # これによりCloud Runのログに確実に記録される
+    log_level_map = {
+        "INFO": current_app.logger.info,
+        "WARNING": current_app.logger.warning,
+        "ERROR": current_app.logger.error,
+        "CRITICAL": current_app.logger.critical,
+    }
+    logger_func = log_level_map.get(level.upper(), current_app.logger.info)
+    logger_func(json.dumps(log_payload, default=str))
+
+    # 追加で中央ログ集約サービスへも送信を試みる
+    if Config.LOG_AGGREGATOR_URL:
+        try:
+            requests.post(Config.LOG_AGGREGATOR_URL, json=log_payload, timeout=2.0)
+        except requests.RequestException as e:
+            # 送信失敗は警告として記録するが、処理は続行する
+            current_app.logger.warning(
+                f"Failed to send log to aggregator: {e}",
+                extra={"aggregator_url": Config.LOG_AGGREGATOR_URL}
+            )
+
+
+# ==============================================================================
 # Application Factory
 # ==============================================================================
 def create_app(config_object: Config) -> Flask:
     """Flaskアプリケーションインスタンスを生成・設定して返す"""
     app = Flask(__name__)
 
-    # --- 設定の読み込みと検証 ---
+    # --- 1. Gunicornロガーとの統合を最初に設定 ---
+    gunicorn_logger = logging.getLogger("gunicorn.error")
+    app.logger.handlers = gunicorn_logger.handlers
+    app.logger.setLevel(gunicorn_logger.level)
+
+    # --- 2. 設定の読み込みと検証 ---
     try:
         required = ["GCP_PROJECT_ID", "AUDIENCE", "LOG_AGGREGATOR_URL"]
         missing = [v for v in required if not getattr(config_object, v)]
@@ -101,10 +114,14 @@ def create_app(config_object: Config) -> Flask:
             raise ValueError(f"不足している必須環境変数があります: {', '.join(missing)}")
         
         app.config.from_object(config_object)
-        log_structured("INFO", "アプリケーション設定の読み込みが完了しました。")
+        
+        # appコンテキスト内でロギング
+        with app.app_context():
+            log_structured("INFO", "アプリケーション設定の読み込みが完了しました。")
 
     except Exception as e:
-        log_structured("CRITICAL", "FATAL: 設定読み込み中にエラー", error=str(e), exc_info=True)
+        # このログが今度こそCloud Runに表示されるはず
+        app.logger.critical(f"FATAL: 設定読み込み中にエラー: {e}", exc_info=True)
         raise
     
     # --- Decorators ---
@@ -155,21 +172,15 @@ def create_app(config_object: Config) -> Flask:
             article_doc = {
                 "title": data.get("title"), "sourceType": data.get("sourceType"),
                 "description": data.get("description", ""), "keywords": data.get("keywords", []),
-                "content": {
-                    "rawText": data["content"].get("rawText"),
-                    "structuredData": data["content"].get("structuredData", {}),
-                },
+                "content": { "rawText": data["content"].get("rawText"), "structuredData": data["content"].get("structuredData", {}), },
                 "aiGenerated": {}, "status": "received",
                 "createdAt": firestore.SERVER_TIMESTAMP, "updatedAt": firestore.SERVER_TIMESTAMP,
             }
-
             _, doc_ref = db.collection(app.config["STAGING_COLLECTION"]).add(article_doc)
             doc_id = doc_ref.id
 
             log_structured("INFO", "新しい記事をステージングしました", document_id=doc_id, title=article_doc["title"])
-            return jsonify({
-                "status": "success", "message": "記事データを受け付けました。", "documentId": doc_id,
-            }), 201
+            return jsonify({ "status": "success", "message": "記事データを受け付けました。", "documentId": doc_id, }), 201
 
         except Exception as e:
             log_structured("ERROR", "記事の投入処理中に予期せぬエラー", error=str(e), exc_info=True, request_data=data)
@@ -189,5 +200,10 @@ app = create_app(config)
 
 if __name__ == "__main__":
     port = int(os.environ.get("PORT", 8080))
+    # ローカル実行時はGunicornロガーが存在しないため、基本的なハンドラを設定
+    handler = logging.StreamHandler(sys.stdout)
+    handler.setFormatter(logging.Formatter('%(asctime)s - %(name)s - %(levelname)s - %(message)s'))
+    app.logger.addHandler(handler)
+    app.logger.setLevel(logging.INFO)
     app.run(host="0.0.0.0", port=port, debug=True)
 
